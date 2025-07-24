@@ -357,6 +357,9 @@ class DocumentIntelligenceService {
         // Parse specific fields from the PDF content
         const extractedFields = this.parseDocumentFields(fullText);
         
+        // Extract tables from the text
+        const extractedTables = this.extractTablesFromText(fullText);
+        
         const extractedData = {
             fileName: file.originalname,
             fileSize: file.size,
@@ -366,7 +369,7 @@ class DocumentIntelligenceService {
                 pageCount: pdfData.numpages,
                 text: fullText,
                 keyValuePairs: extractedFields,
-                tables: this.extractTablesFromText(fullText),
+                tables: extractedTables,
                 metadata: {
                     processingTime: `${processingTime} seconds`,
                     confidence: "95%",
@@ -405,25 +408,31 @@ class DocumentIntelligenceService {
         // Define improved patterns for the specific document format
         const patterns = {
             'PO Number': [
-                /(PR\d{6})/i,
+                /PO\s+Number\s*:\s*(\d+)/i,
                 /PO\s+No\.?\s*:?\s*([A-Z0-9]+)/i,
-                /Purchase\s+Order[:\s]*([A-Z0-9]+)/i
+                /Purchase\s+Order[:\s]*([A-Z0-9]+)/i,
+                /(PR\d{6})/i
             ],
             'Vendor Name': [
-                /Vendor[:\s]*\n([^\n]+)/i,
-                /(?:^|\n)([A-Za-z\s,]+(?:LLC|Inc|Corp|Ltd))/m,
-                /Barkman\s+Honey[^\n]*/i
+                /\nTO:\s*\n([A-Za-z\s&,\.]+)\s*\n/im,
+                /^TO:\s*\n([A-Za-z\s&,\.]+)\s*\n/im,
+                /BILL\s+TO:\s*\n([^\n]+)/i,
+                /(?:^|\n)([A-Za-z\s,&]+(?:LLC|Inc|Corp|Ltd|Co\.|international))/im,
+                /Vendor[:\s]*\n([^\n]+)/i
             ],
             'Vendor Address': [
-                /Vendor\s+Address[:\s]*([^\n]+(?:\n[^\n:]+)*?)(?=Ship\s+To|$)/i,
+                /\nTO:\s*\n[^\n]+\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\n[a-z@]|\nSHIP\s+TO|\n\s*\n)/i,
+                /^TO:\s*\n[^\n]+\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\n[a-z@]|\nSHIP\s+TO|\n\s*\n)/i,
+                /BILL\s+TO:\s*\n[^\n]+\n([^\n]+(?:\n[^\n]+)*?)(?=\nPhone|TO:|$)/i,
                 /(\d+\s+[A-Za-z\s]+\n[A-Za-z\s]+\s+[A-Z]{2}\s+\d{5})/m
             ],
             'Ship To Address': [
-                /Ship\s+To\s+Address[:\s]*[^\n]*\n([^\n]+(?:\n[^\n]+)*?)(?=\n\s*\n|\nReq\s+Date|$)/i,
-                /Bennett's\s+Honey\s+Farm[^\n]*\n([^\n]+(?:\n[^\n]+)*?)(?=\n\s*\n|Phone|$)/i,
-                /(Bennett's\s+Honey\s+Farm[^\n]*(?:\n[^\n]+)*?)(?=\nReq\s+Date|\nPhone|$)/i
+                /SHIP\s+TO:\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\nPhone|\n\s*\n|P\.O\.|$)/i,
+                /Ship\s+To\s+Address[:\s]*[^\n]*\n([^\n]+(?:\n[^\n]+)*?)(?=\n\s*\n|\nReq\s+Date|$)/i
             ],
             'Order Date': [
+                /(\d{4}-\d{2}-\d{2})/,
+                /P\.O\.\s+DATE\s+[^\n]*\n[^\n]*\n([^\n\s]+)/i,
                 /Order\s+Date[:\s]*(\d{2}-\d{2}-\d{2,4})/i,
                 /(\d{2}-[A-Za-z]{3}-\d{4})/i
             ],
@@ -432,21 +441,29 @@ class DocumentIntelligenceService {
                 /Required[:\s]*(\d{2}-\d{2}-\d{2,4})/i
             ],
             'Total Amount': [
+                /GRAND\s+TOTAL\s*\$?([0-9,]+\.?\d{0,2})/i,
                 /Order\s+Total[:\s]*\$?\s*([0-9,]+\.?\d{0,2})/i,
                 /Total[:\s]*\$?\s*([0-9,]+\.?\d{0,2})/i
             ],
             'Subtotal': [
+                /SUBTOTAL\s*\$?\s*([0-9,]+\.?\d{0,2})/i,
                 /Sub\s+Total[:\s]*\$?\s*([0-9,]+\.?\d{0,2})/i,
                 /Subtotal[:\s]*\$?\s*([0-9,]+\.?\d{0,2})/i
             ],
             'Phone Number': [
+                /Phone[:\s]*(\(\d{3}\)\s*\d{3}-\d{4})/i,
                 /Phone[:\s]*(\d{3}-\d{3}-\d{4})/i,
-                /(\d{3}-\d{3}-\d{4})/
+                /Phone[:\s]*(\d{3}\.\d{3}\.\d{4})/i,
+                /(\(\d{3}\)\s*\d{3}-\d{4})/,
+                /(\d{3}-\d{3}-\d{4})/,
+                /(\d{3}\.\d{3}\.\d{4})/
             ],
             'Fax Number': [
+                /Fax[:\s]*(\(\d{3}\)\s*\d{3}-\d{4})/i,
                 /Fax[:\s]*(\d{3}-\d{3}-\d{4})/i
             ],
             'Ship Via': [
+                /SHIPPED\s+VIA[:\s]*([A-Z0-9\s]+)/i,
                 /Ship\s*Via[:\s]*([A-Z0-9]+)/i,
                 /ShipVia[:\s]*([A-Z0-9]+)/i
             ]
@@ -585,7 +602,198 @@ class DocumentIntelligenceService {
     }
 
     extractTablesFromText(text) {
-        // Simple table detection - look for structured data patterns
+        const tables = [];
+        
+        // Extract line items specifically
+        const lineItems = this.extractLineItems(text);
+        if (lineItems.length > 0) {
+            tables.push({
+                tableName: "Line Items",
+                rowCount: lineItems.length + 1, // +1 for header
+                columnCount: 10, // ITEM, UNIT, QTY, PART NO, DESCRIPTION, DUE DATE, PRICE, TAX%, DISC, LINE TOTAL
+                headers: ["ITEM", "UNIT", "QTY", "PART NO", "DESCRIPTION", "DUE DATE", "PRICE", "TAX%", "DISC", "LINE TOTAL"],
+                cells: lineItems.map((item, index) => ({
+                    rowIndex: index + 1, // +1 for header row
+                    item: item,
+                    confidence: 0.90
+                })),
+                lineItems: lineItems
+            });
+        }
+        
+        // Keep the original simple table detection as fallback
+        const genericTables = this.extractGenericTables(text);
+        tables.push(...genericTables);
+        
+        return tables;
+    }
+
+    extractLineItems(text) {
+        const lineItems = [];
+        const lines = text.split('\n');
+        
+        // Look for line item patterns after the header
+        let inItemSection = false;
+        let headerEndIndex = -1;
+        
+        // Find the table header that spans multiple lines
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Look for the start of header section
+            if (line === 'ITEM') {
+                // Check if this is followed by the other header fields
+                let headerPattern = '';
+                for (let j = 0; j < 10 && i + j < lines.length; j++) {
+                    headerPattern += lines[i + j].trim() + ' ';
+                }
+                
+                if (headerPattern.includes('ITEM') && headerPattern.includes('UNIT') && 
+                    headerPattern.includes('QTY') && headerPattern.includes('DESCRIPTION')) {
+                    inItemSection = true;
+                    headerEndIndex = i + 10; // Skip header lines
+                    break;
+                }
+            }
+        }
+        
+        if (!inItemSection) {
+            console.log('No table header found');
+            return lineItems;
+        }
+        
+        console.log(`Starting line item parsing at line ${headerEndIndex}`);
+        
+        // Parse items starting after the header - collect chunks of related data
+        for (let i = headerEndIndex; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Stop at subtotal or similar or when we hit another table
+            if (line.includes('SUBTOTAL') || line.includes('GRAND TOTAL') || 
+                (line === 'ITEM' && i > headerEndIndex + 20)) {
+                break;
+            }
+            
+            // Skip empty lines
+            if (line.length === 0) {
+                continue;
+            }
+            
+            // Check if this line is a valid item number (2-3 digits, to filter out real item numbers)
+            const itemNumberMatch = line.match(/^(\d{2,3})$/);
+            
+            if (itemNumberMatch && parseInt(itemNumberMatch[1]) >= 10) {
+                const itemNumber = itemNumberMatch[1];
+                
+                // Collect the next 11 lines which should contain the item data
+                const itemData = {
+                    itemNumber: itemNumber,
+                    unit: '',
+                    quantity: '',
+                    partNumber: '',
+                    description: '',
+                    dueDate: '',
+                    price: '',
+                    taxPercent: '',
+                    discount: '',
+                    lineTotal: ''
+                };
+                
+                // Expected pattern after item number:
+                // 1: UNIT (EA)
+                // 2: QTY (1, 5, etc)
+                // 3: Empty line or spacer
+                // 4: PART NO (long number)
+                // 5: DESCRIPTION line 1 (product name)
+                // 6: DESCRIPTION line 2 (color/details)  
+                // 7: DUE DATE (YYYY-MM-DD)
+                // 8: PRICE ($ X.XX)
+                // 9: TAX% (number)
+                // 10: DISC (percentage)
+                // 11: LINE TOTAL ($ X.XX)
+                
+                for (let j = 1; j <= 11 && i + j < lines.length; j++) {
+                    const dataLine = lines[i + j].trim();
+                    
+                    if (dataLine.length === 0) continue;
+                    
+                    switch (j) {
+                        case 1: // UNIT
+                            if (dataLine === 'EA' || dataLine.match(/^[A-Z]{1,3}$/)) {
+                                itemData.unit = dataLine;
+                            }
+                            break;
+                        case 2: // QTY
+                            if (dataLine.match(/^\d+$/)) {
+                                itemData.quantity = dataLine;
+                            }
+                            break;
+                        case 4: // PART NO
+                            if (dataLine.match(/^\d{10,}$/)) {
+                                itemData.partNumber = dataLine;
+                            }
+                            break;
+                        case 5: // DESCRIPTION line 1
+                            if (!dataLine.match(/^\d/) && !dataLine.includes('$') && !dataLine.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                                itemData.description = dataLine;
+                            }
+                            break;
+                        case 6: // DESCRIPTION line 2 (color)
+                            if (!dataLine.match(/^\d/) && !dataLine.includes('$') && !dataLine.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                                if (itemData.description) {
+                                    itemData.description += ' ' + dataLine;
+                                } else {
+                                    itemData.description = dataLine;
+                                }
+                            }
+                            break;
+                        case 7: // DUE DATE
+                            if (dataLine.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                                itemData.dueDate = dataLine;
+                            }
+                            break;
+                        case 8: // PRICE
+                            const priceMatch = dataLine.match(/\$\s*([0-9,]+\.?\d{0,2})/);
+                            if (priceMatch) {
+                                itemData.price = priceMatch[1];
+                            }
+                            break;
+                        case 9: // TAX%
+                            if (dataLine.match(/^\d+$/) && parseInt(dataLine) <= 30) {
+                                itemData.taxPercent = dataLine + '%';
+                            }
+                            break;
+                        case 10: // DISC
+                            if (dataLine.match(/^\d+%$/)) {
+                                itemData.discount = dataLine;
+                            }
+                            break;
+                        case 11: // LINE TOTAL
+                            const totalMatch = dataLine.match(/\$\s*([0-9,]+\.?\d{0,2})/);
+                            if (totalMatch) {
+                                itemData.lineTotal = totalMatch[1];
+                            }
+                            break;
+                    }
+                }
+                
+                // Only add if we have some meaningful data
+                if (itemData.unit || itemData.quantity || itemData.partNumber || itemData.description) {
+                    lineItems.push(itemData);
+                    console.log(`Extracted item ${itemData.itemNumber}: ${itemData.description}`);
+                }
+                
+                // Skip ahead past this item's data
+                i += 11;
+            }
+        }
+        
+        console.log(`Extracted ${lineItems.length} line items`);
+        return lineItems;
+    }
+
+    extractGenericTables(text) {
+        // Keep the original simple table detection as fallback
         const lines = text.split('\n');
         const tables = [];
         let currentTable = [];
@@ -604,6 +812,7 @@ class DocumentIntelligenceService {
                 // End of table
                 if (currentTable.length >= 2) { // Only add if table has multiple rows
                     tables.push({
+                        tableName: "Generic Table",
                         rowCount: currentTable.length,
                         columnCount: Math.max(...currentTable.map(row => row.content.split(/\s{2,}|\t/).length)),
                         cells: currentTable
